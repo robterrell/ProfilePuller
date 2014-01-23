@@ -4,6 +4,7 @@
 # By Alexey Baj <alexey.baj@gmail.com> for Rob Terrell / TouchCentric
 #
 # Copyright 2010 TouchCentric LLC. All rights reserved.
+#
 
 import sys, re, urllib, urllib2, urlparse, cookielib, gzip, StringIO, optparse, os
 
@@ -48,12 +49,40 @@ def extract_helper(regex, data):
         return match.group(1)
     raise Exception('Unexpected web page structure')
 
+def downloadProfilesFromPageContent( content, provision_url, specifiedProfileName=None ):
+	downloadable_links = re.findall( 'href="(.+blobId=(.+))">', content )
+	if not downloadable_links:
+		return False
+
+	if specifiedProfileName:
+		match = re.findall( 'href=".+view\.action\?provDisplayId=(.+)">(<span>|)(.+?)</', content )    
+		match = [x[0] for x in match if x[2] == specifiedProfileName]
+		if not match:
+			return False
+
+		downloadable_links = [x for x in downloadable_links if x[1] == match[0]]
+		if not downloadable_links:
+			return False
+
+	for link in downloadable_links:
+		data, headers = fetch_with_headers( urlparse.urljoin( provision_url, link[0] ) )
+		fname = extract_helper( 'filename=(.+)', headers['Content-Disposition'] )
+		with open( fname, 'wb' ) as f:
+			f.write( data )
+			print "Downloaded a profile named: %s [%s]" % ( fname, link[0] )
+
+		if options.openAfterSaving:
+			os.system( 'open "'+fname+'"' )
+
+	return True
+
+
 # handle cookies 
 opener = urllib2.build_opener(urllib2.HTTPCookieProcessor(MyCookieJar()))
 urllib2.install_opener(opener)
 
 # process options
-p = optparse.OptionParser(description='A script to fetch provision profiles from Apple site', prog='profile.py', \
+p = optparse.OptionParser( description='A script to fetch provision profiles from Apple site', prog='profile.py', \
     version='1.0', usage='usage: %prog file -a <appleID> -p <password> -t <team> -P <profile_name> -o')
 
 p.add_option('-a', "--account", dest='appleID', help='Account\'s Apple ID')
@@ -66,54 +95,66 @@ options, arguments = p.parse_args()
 if not options.appleID or not options.password:
     bail_out('Both Apple ID and password have to be specified')
 
+#https://developer.apple.com/devcenter/ios/index.action
 initial_url = 'http://developer.apple.com/iphone/index.action'
+
+
+
+
+
 # determine login url
-data = fetch(initial_url)
-login_url = extract_helper('href="(.+?login.+)"', data)
+data = fetch( initial_url )
+login_url = extract_helper( 'href="(.+?login.+)"', data )
+
+
 # fetch login page
-data = fetch(login_url)
-form_action = urlparse.urljoin(login_url, extract_helper('action="(.+DSAuthWeb\.woa.+)"' , data))
-# perform login
-data = fetch(form_action, {'theAccountName':options.appleID, 'theAccountPW':options.password})
-if data.find('DSAuthWeb') != -1:
-    bail_out("Provided credentials are not authorized.")
-    
-data = fetch(initial_url)
-if data.find('saveTeamSelection.action') != -1:
-    # additional team selection step
-    match = re.search('value="(.+)">%s</option>' % options.team, data)
+data = fetch( login_url )
+form_action = urlparse.urljoin( login_url, extract_helper( 'action="(.+DSAuthWeb\.woa.+)"' , data ) )
+
+
+# perform login, if the page still has the login URL assume a login failure
+data = fetch( form_action, { 'theAccountName' : options.appleID, 'theAccountPW' : options.password } )
+if data.find( 'DSAuthWeb' ) != -1:
+    bail_out( "Provided credentials are not authorized." )
+
+
+# if we fetch the initial URL again and the content contains 'saveTeamSelection',
+# assume that we are being asked to choose a team
+data = fetch( initial_url )
+if data.find( 'saveTeamSelection.action' ) != -1:
+    match = re.search( 'value="(.+)">%s</option>' % options.team, data )
     if not match:
-        bail_out('Team %s is not found.' % options.team)
-    form_action = urlparse.urljoin(initial_url, '/iphone/saveTeamSelection.action')
-    data = fetch(form_action, {'memberDisplayId':match.group(1), 'action:saveTeamSelection!save':'Continue'})
-    
-if data.find('/iphone/my/') == -1:
+        bail_out( 'Team %s is not found.' % options.team )
+        
+    form_action = urlparse.urljoin( initial_url, '/iphone/saveTeamSelection.action' )
+    data = fetch( form_action, { 'memberDisplayId' : match.group(1), 'action:saveTeamSelection!save' : 'Continue' } )
+
+
+# no idea what /iphone/my/ indicates, somehow the profile urls are diff.
+if data.find( '/iphone/my/' ) == -1:
     provision_url = 'http://developer.apple.com/iphone/manage/provisioningprofiles/index.action'
 else:
     provision_url = 'http://developer.apple.com/iphone/my/provision/index.action'
 
-# fetching list of profiles
-data = fetch(provision_url)
 
-downloadable_links = re.findall('href="(.+blobId=(.+))">', data)
-if not downloadable_links:
-	bail_out('There are no downloadable profiles.')
-    
-if options.profile:
-    # if profile was specified, leave only it in a list
-    match = re.findall('href=".+view\.action\?provDisplayId=(.+)">(<span>|)(.+?)</', data)    
-    match = [x[0] for x in match if x[2] == options.profile]
-    if not match:
-        bail_out('There is no %s profile.' % options.profile)
-    downloadable_links = [x for x in downloadable_links if x[1] == match[0]]
-    if not downloadable_links:    
-        bail_out('Profile %s is present but not downloadable.' % options.profile)
+# fetching list of dev. profiles
+data = fetch( provision_url )
 
-for link in downloadable_links:
-    data, headers = fetch_with_headers(urlparse.urljoin(provision_url, link[0]))
-    fname = extract_helper('filename=(.+)', headers['Content-Disposition'])
-    with open(fname, 'wb') as f:
-        f.write(data)
-    if options.openAfterSaving:
-	    os.system('open "'+fname+'"')
 
+# search in dev. profiles for a match or download all
+if( downloadProfilesFromPageContent( data, provision_url, options.profile ) and options.profile ):
+	# specified profile was found in the dev. profiles - stop processing
+	sys.exit( 0 )
+
+
+# follow the 'Distribution' Link
+if data.find( 'viewDistributionProfiles.action' ) == -1:
+    bail_out( "Could not locate the Distribution Profiles link" )
+
+dist_profiles_relative_url = extract_helper( 'href="(.+viewDistributionProfiles.+)"', data )
+data = fetch( urlparse.urljoin( initial_url, dist_profiles_relative_url ) )
+
+
+# search in dist. profiles for a match or download all
+if( downloadProfilesFromPageContent( data, provision_url, options.profile ) is False ):
+	bail_out( "No profiles named %s were found in the dev. or dist. profiles" % options.profile )
